@@ -11,7 +11,6 @@ using Microsoft.Build.Evaluation;
 using Microsoft.Build.Exceptions;
 using Microsoft.Build.Execution;
 using Microsoft.Build.Framework;
-using Microsoft.Build.Logging;
 using Microsoft.DotNet.Cli.CommandFactory;
 using Microsoft.DotNet.Cli.Commands.Restore;
 using Microsoft.DotNet.Cli.Commands.Run.LaunchSettings;
@@ -19,6 +18,7 @@ using Microsoft.DotNet.Cli.CommandLine;
 using Microsoft.DotNet.Cli.Extensions;
 using Microsoft.DotNet.Cli.Utils;
 using Microsoft.DotNet.Cli.Utils.Extensions;
+using Microsoft.DotNet.Cli.MSBuildEvaluation;
 using Microsoft.DotNet.FileBasedPrograms;
 
 namespace Microsoft.DotNet.Cli.Commands.Run;
@@ -140,7 +140,7 @@ public class RunCommand
             return 1;
         }
 
-        Func<ProjectCollection, ProjectInstance>? projectFactory = null;
+        Func<DotNetProjectEvaluator, DotNetProject>? projectFactory = null;
         RunProperties? cachedRunProperties = null;
         VirtualProjectBuildingCommand? virtualCommand = null;
         if (ShouldBuild)
@@ -166,7 +166,7 @@ public class RunCommand
                 virtualCommand.MarkArtifactsFolderUsed();
 
                 var cacheEntry = virtualCommand.GetPreviousCacheEntry();
-                projectFactory = CanUseRunPropertiesForCscBuiltProgram(BuildLevel.None, cacheEntry) ? null : virtualCommand.CreateProjectInstance;
+                projectFactory = CanUseRunPropertiesForCscBuiltProgram(BuildLevel.None, cacheEntry) ? null : virtualCommand.CreateVirtualProject;
                 cachedRunProperties = cacheEntry?.Run;
             }
         }
@@ -232,7 +232,7 @@ public class RunCommand
         Debug.Assert(EntryPointFileFullPath is not null);
 
         var globalProperties = CommonRunHelpers.GetGlobalPropertiesFromArgs(MSBuildArgs);
-        
+
         // If a framework is already specified via --framework, no need to check
         if (globalProperties.TryGetValue("TargetFramework", out var existingFramework) && !string.IsNullOrWhiteSpace(existingFramework))
         {
@@ -264,10 +264,10 @@ public class RunCommand
     {
         var sourceFile = SourceFile.Load(sourceFilePath);
         var directives = FileLevelDirectiveHelpers.FindDirectives(sourceFile, reportAllErrors: false, DiagnosticBag.Ignore());
-        
+
         var targetFrameworksDirective = directives.OfType<CSharpDirective.Property>()
             .FirstOrDefault(p => string.Equals(p.Name, "TargetFrameworks", StringComparison.OrdinalIgnoreCase));
-        
+
         if (targetFrameworksDirective is null)
         {
             return null;
@@ -413,14 +413,14 @@ public class RunCommand
         }
     }
 
-    private void EnsureProjectIsBuilt(out Func<ProjectCollection, ProjectInstance>? projectFactory, out RunProperties? cachedRunProperties, out VirtualProjectBuildingCommand? virtualCommand)
+    private void EnsureProjectIsBuilt(out Func<DotNetProjectEvaluator, DotNetProject>? projectFactory, out RunProperties? cachedRunProperties, out VirtualProjectBuildingCommand? virtualCommand)
     {
         int buildResult;
         if (EntryPointFileFullPath is not null)
         {
             virtualCommand = CreateVirtualCommand();
             buildResult = virtualCommand.Execute();
-            projectFactory = CanUseRunPropertiesForCscBuiltProgram(virtualCommand.LastBuild.Level, virtualCommand.LastBuild.Cache?.PreviousEntry) ? null : virtualCommand.CreateProjectInstance;
+            projectFactory = CanUseRunPropertiesForCscBuiltProgram(virtualCommand.LastBuild.Level, virtualCommand.LastBuild.Cache?.PreviousEntry) ? null : virtualCommand.CreateVirtualProject;
             cachedRunProperties = virtualCommand.LastBuild.Cache?.CurrentEntry.Run;
         }
         else
@@ -493,7 +493,7 @@ public class RunCommand
         }
     }
 
-    internal ICommand GetTargetCommand(Func<ProjectCollection, ProjectInstance>? projectFactory, RunProperties? cachedRunProperties)
+    internal ICommand GetTargetCommand(Func<DotNetProjectEvaluator, DotNetProject>? projectFactory, RunProperties? cachedRunProperties)
     {
         if (cachedRunProperties != null)
         {
@@ -514,42 +514,37 @@ public class RunCommand
 
         Reporter.Verbose.WriteLine("Getting target command: evaluating project.");
         FacadeLogger? logger = LoggerUtility.DetermineBinlogger([.. MSBuildArgs.OtherMSBuildArgs], "dotnet-run");
-        var (project, telemetryCentralLogger) = EvaluateProject(ProjectFileFullPath, projectFactory, MSBuildArgs, logger);
+        using var evaluator = DotNetProjectEvaluatorFactory.CreateForCommand(MSBuildArgs, logger is null ? null : [logger]);
+        var project = EvaluateProject(ProjectFileFullPath, evaluator, projectFactory);
         ValidatePreconditions(project);
-        InvokeRunArgumentsTarget(project, NoBuild, logger, MSBuildArgs, telemetryCentralLogger);
+        InvokeRunArgumentsTarget(project, NoBuild, logger, MSBuildArgs, evaluator);
         logger?.ReallyShutdown();
         var runProperties = RunProperties.FromProject(project).WithApplicationArguments(ApplicationArgs);
         var command = CreateCommandFromRunProperties(runProperties);
         return command;
 
-        static (ProjectInstance project, ILogger? telemetryCentralLogger) EvaluateProject(string? projectFilePath, Func<ProjectCollection, ProjectInstance>? projectFactory, MSBuildArgs msbuildArgs, ILogger? binaryLogger)
+        static DotNetProject EvaluateProject(string? projectFilePath, DotNetProjectEvaluator evaluator, Func<DotNetProjectEvaluator, DotNetProject>? projectFactory)
         {
             Debug.Assert(projectFilePath is not null || projectFactory is not null);
-
-            var globalProperties = CommonRunHelpers.GetGlobalPropertiesFromArgs(msbuildArgs);
-
-            // Include telemetry logger for evaluation and capture it for reuse in builds
-            var (loggers, telemetryCentralLogger) = ProjectInstanceExtensions.CreateLoggersWithTelemetry(binaryLogger is null ? null : [binaryLogger]);
-            var collection = new ProjectCollection(globalProperties: globalProperties, loggers: loggers, toolsetDefinitionLocations: ToolsetDefinitionLocations.Default);
-
-            ProjectInstance projectInstance;
+            DotNetProject project;
             if (projectFilePath is not null)
             {
-                projectInstance = collection.LoadProject(projectFilePath).CreateProjectInstance();
+                project = evaluator.LoadProject(projectFilePath);
             }
             else
             {
                 Debug.Assert(projectFactory is not null);
-                projectInstance = projectFactory(collection);
+                project = projectFactory(evaluator);
             }
 
-            return (projectInstance, telemetryCentralLogger);
+            // We don't dispose the evaluator here because the telemetryCentralLogger is used later
+            return project;
         }
 
-        static void ValidatePreconditions(ProjectInstance project)
+        static void ValidatePreconditions(DotNetProject project)
         {
             // there must be some kind of TFM available to run a project
-            if (string.IsNullOrWhiteSpace(project.GetPropertyValue("TargetFramework")) && string.IsNullOrEmpty(project.GetPropertyValue("TargetFrameworks")))
+            if (string.IsNullOrWhiteSpace(project.TargetFramework) || project.TargetFrameworks is null or { Length: 0 })
             {
                 ThrowUnableToRunError(project);
             }
@@ -571,7 +566,7 @@ public class RunCommand
             return command;
         }
 
-        static void SetRootVariableName(ICommand command, string runtimeIdentifier, string defaultAppHostRuntimeIdentifier, string targetFrameworkVersion)
+        static void SetRootVariableName(ICommand command, string? runtimeIdentifier, string? defaultAppHostRuntimeIdentifier, string? targetFrameworkVersion)
         {
             var rootVariableName = EnvironmentVariableNames.TryGetDotNetRootVariableName(
                 runtimeIdentifier,
@@ -600,7 +595,7 @@ public class RunCommand
             return command;
         }
 
-        static void InvokeRunArgumentsTarget(ProjectInstance project, bool noBuild, FacadeLogger? binaryLogger, MSBuildArgs buildArgs, ILogger? telemetryCentralLogger)
+        static void InvokeRunArgumentsTarget(DotNetProject project, bool noBuild, FacadeLogger? binaryLogger, MSBuildArgs buildArgs, DotNetProjectEvaluator evaluator)
         {
             List<ILogger> loggersForBuild = [
                 CommonRunHelpers.GetConsoleLogger(
@@ -612,7 +607,9 @@ public class RunCommand
                 loggersForBuild.Add(binaryLogger);
             }
 
-            if (!project.BuildWithTelemetry([Constants.ComputeRunArguments], loggersForBuild, null, out _, telemetryCentralLogger))
+            var builder = evaluator.CreateBuilder(project);
+            var result = builder.Build([Constants.ComputeRunArguments], loggersForBuild);
+            if (!result.Success)
             {
                 throw new GracefulException(CliCommandStrings.RunCommandEvaluationExceptionBuildFailed, Constants.ComputeRunArguments);
             }
@@ -620,14 +617,14 @@ public class RunCommand
     }
 
     [DoesNotReturn]
-    internal static void ThrowUnableToRunError(ProjectInstance project)
+    internal static void ThrowUnableToRunError(DotNetProject project)
     {
         throw new GracefulException(
                 string.Format(
                     CliCommandStrings.RunCommandExceptionUnableToRun,
-                    project.GetPropertyValue("MSBuildProjectFullPath"),
+                    project.FullPath,
                     Product.TargetFrameworkVersion,
-                    project.GetPropertyValue("OutputType")));
+                    project.OutputType));
     }
 
     private static string? DiscoverProjectFilePath(string? filePath, string? projectFileOrDirectoryPath, bool readCodeFromStdin, ref string[] args, out string? entryPointFilePath)
