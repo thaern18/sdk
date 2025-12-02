@@ -215,7 +215,7 @@ namespace Microsoft.DotNet.Cli.Test.Tests
             CommandResult result = new DotnetTestCommand(Log, disableNewOutput: false)
                 .WithWorkingDirectory(testInstance.Path)
                 .Execute(
-                    MicrosoftTestingPlatformOptions.ConfigurationOption.Name, TestingConstants.Debug);
+                    TestCommandDefinition.ConfigurationOption.Name, TestingConstants.Debug);
 
             result.StdOut.Should()
                 .Contain("Using launch settings from")
