@@ -153,8 +153,8 @@ namespace Microsoft.DotNet.Cli.Test.Tests
 
             CommandResult result = new DotnetTestCommand(Log, disableNewOutput: false)
                                     .WithWorkingDirectory(testInstance.Path)
-                                    .Execute(TestCommandDefinition.ConfigurationOption.Name, configuration);
                                     .WithEnvironmentVariable("TEST_ENV_VAR", "TestValue1")
+                                    .Execute(TestCommandDefinition.ConfigurationOption.Name, configuration);
 
             if (!TestContext.IsLocalized())
             {
